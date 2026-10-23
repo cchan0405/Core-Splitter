@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Detect TMA core candidates and write derived QPTIFF crops.
-No source pixels are masked or rescaled. See README for compatibility limits.
+"""Detect TMA cores and export ALL biomarker channels as named OME-TIFF planes.
+Install: pip install numpy tifffile imagecodecs zarr scipy scikit-image pillow
+Run: python split_tma_all_biomarkers.py slide.qptiff core_output --channel DAPI --export
+For reviewed boxes: add --review-csv core_output/cores.csv --export
+DAPI selects the detection image ONLY; every full-resolution channel is exported.
+core_preview.png is a single-channel detection preview, not the biomarker image.
+Open core_XXX.ome.tif in an OME-aware viewer such as QuPath or Fiji/Bio-Formats.
+Source pixels, intensity values and bit depth are preserved without masking.
+Output is OME-TIFF, not vendor QPTIFF; vendor-specific metadata is not transferred.
+Input layout restrictions from the original splitter still apply.
 """
 import argparse
 import csv
@@ -142,54 +150,68 @@ def write_page(writer, a, source, kind, identifier, scale=1, baseline=False, box
 
 
 def export_core(tif, pages, names, row, dest):
-    box = tuple(int(row[k]) for k in ('x0','y0','x1','y1'))
-    h,w = pages[0].shape
+    """Write all source channel crops into one explicitly named OME channel axis."""
+    box = tuple(int(row[k]) for k in ('x0', 'y0', 'x1', 'y1'))
+    h, w = pages[0].shape
     if not (0 <= box[0] < box[2] <= w and 0 <= box[1] < box[3] <= h):
         raise ValueError(f'Invalid bounds for {row["core_id"]}')
-    identifier = str(uuid.uuid4()).upper()
-    target = dest / (row['core_id']+'.qptiff')
-    if target.exists(): raise FileExistsError(target)
-    tmp = target.with_suffix('.qptiff.partial')
-    # One channel at a time. Smaller pyramid arrays are retained for level-major IFD order.
-    pyramids = []
-    composite = None
+    dtype = pages[0].dtype
+    if any(page.dtype != dtype for page in pages):
+        raise ValueError('Mixed channel dtypes cannot be preserved in one OME series.')
+    target = dest / (row['core_id'] + '.ome.tif')
+    tmp = target.with_suffix('.tif.partial')
+    if target.exists() or tmp.exists():
+        raise FileExistsError(target if target.exists() else tmp)
+    metadata = {'axes': 'CYX', 'Channel': {'Name': names},
+                'Description': 'Unmodified channel pixels cropped from ' + str(Path(tif.filename).name)
+                               + '; source XY bounds: ' + str(box)}
+    # QPI Color is an RGB comma-separated triplet. OME Color is signed RGBA.
+    colors = []
+    for page in pages:
+        try:
+            rgb = [int(x.strip()) for x in xml(page).findtext('Color').split(',')]
+            if len(rgb) != 3 or any(x < 0 or x > 255 for x in rgb):
+                raise ValueError('Invalid RGB')
+            rgba = (rgb[0] << 24) | (rgb[1] << 16) | (rgb[2] << 8) | 255
+            colors.append(rgba if rgba < 2**31 else rgba - 2**32)
+        except (AttributeError, ValueError):
+            colors = []
+            break
+    if colors:
+        metadata['Channel']['Color'] = colors
+    source = pages[0]
+    if all(key in source.tags for key in ('XResolution', 'YResolution', 'ResolutionUnit')):
+        unit = int(source.tags['ResolutionUnit'].value)
+        microns = {2: 25400., 3: 10000.}.get(unit)
+        if microns:
+            for axis in ('X', 'Y'):
+                resolution = rational(source.tags[axis + 'Resolution'])
+                if resolution > 0:
+                    metadata['PhysicalSize' + axis] = microns / resolution
+                    metadata['PhysicalSize' + axis + 'Unit'] = 'µm'
     try:
-        with tf.TiffWriter(tmp, bigtiff=True) as writer:
-            for c,page in enumerate(pages):
-                a = region(page, box)
-                write_page(writer,a,page,'FullResolution',identifier,baseline=(c==0),box=box)
-                small = a[::max(1,math.ceil(max(a.shape)/500)), ::max(1,math.ceil(max(a.shape)/500))]
-                d = display(small)
-                composite = d if composite is None else np.maximum(composite,d)
-                levels=[]
-                scale=1
-                while max(a.shape) > 2048:
-                    # Nearest-neighbour pyramid; baseline values are untouched.
-                    a = a[::2,::2].copy(); scale *= 2
-                    levels.append((scale,a))
-                pyramids.append(levels)
-            rgb=np.repeat(composite[:,:,None],3,axis=2)
-            thumbscale=max(box[2]-box[0],box[3]-box[1])/max(rgb.shape[:2])
-            write_page(writer,rgb,pages[0],'Thumbnail',identifier,scale=thumbscale,box=box)
-            for level in range(len(pyramids[0])):
-                for c,levels in enumerate(pyramids):
-                    scale,a=levels[level]
-                    write_page(writer,a,pages[c],'ReducedResolution',identifier,scale=scale,box=box)
-            write_page(writer,rgb,pages[0],'Overview',identifier,scale=thumbscale,box=box)
-        # Independently reopen and compare EVERY baseline pixel for EVERY channel.
+        with tf.TiffWriter(tmp, bigtiff=True, ome=True) as writer:
+            writer.write(data=(region(page, box) for page in pages),
+                         shape=(len(pages), box[3]-box[1], box[2]-box[0]),
+                         dtype=dtype, photometric='minisblack', compression='lzw',
+                         metadata=metadata)
         with tf.TiffFile(tmp) as out:
-            groups,sizes,outnames=inventory(out)
-            if outnames != names: raise ValueError('Channel metadata verification failed')
-            for src,exported in zip(pages,groups[sizes[0]]):
-                expected=region(src,box); actual=exported.asarray()
-                if expected.dtype != actual.dtype or not np.array_equal(expected,actual,equal_nan=True):
+            root = ET.fromstring(out.ome_metadata)
+            channels = root.findall('.//{*}Channel')
+            if [ch.get('Name') for ch in channels] != names:
+                raise ValueError('OME channel name/count verification failed')
+            if len(out.pages) != len(pages):
+                raise ValueError('Exported channel page count differs from source')
+            for src, exported in zip(pages, out.pages):
+                expected, actual = region(src, box), exported.asarray()
+                if expected.dtype != actual.dtype or not np.array_equal(expected, actual, equal_nan=True):
                     raise ValueError('Full-resolution pixel verification failed')
         tmp.rename(target)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
-    return dict(file=target.name,box=list(box),identifier=identifier,channels=names,
-                pixel_verification='all full-resolution pixels equal',vendor_integrity='not available for derived files')
+    return dict(file=target.name, box=list(box), channels=names,
+                pixel_verification='all full-resolution pixels equal', format='OME-TIFF')
 
 
 def main():
